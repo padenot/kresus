@@ -1,5 +1,4 @@
 import moment              from 'moment';
-import async               from 'async';
 import NotificationsHelper from 'cozy-notifications-helper';
 
 import Bank          from '../models/bank';
@@ -17,7 +16,7 @@ let log = require('printit')({
 });
 
 // Add backends here.
-let SOURCE_HANDLERS = {};
+const SOURCE_HANDLERS = {};
 function AddBackend(exportObject) {
     if (typeof exportObject.SOURCE_NAME === 'undefined' ||
         typeof exportObject.FetchAccounts === 'undefined' ||
@@ -33,8 +32,8 @@ AddBackend(require('./sources/mock'));
 AddBackend(require('./sources/weboob'));
 
 // Connect static bank information to their backends.
-let ALL_BANKS = require('../../../weboob/banks-all.json');
-let BANK_HANDLERS = {};
+const ALL_BANKS = require('../../../weboob/banks-all.json');
+const BANK_HANDLERS = {};
 for (let bank of ALL_BANKS) {
     if (!bank.backend || !(bank.backend in SOURCE_HANDLERS))
         throw("Bank handler not described in the static JSON file, or not imported.");
@@ -42,6 +41,7 @@ for (let bank of ALL_BANKS) {
 }
 
 
+// Sync function
 function TryMatchAccount(target, accounts) {
 
     for (let a of accounts) {
@@ -79,62 +79,41 @@ function TryMatchAccount(target, accounts) {
 }
 
 
-function MergeAccounts(old, kid, callback) {
-
-    if (old.accountNumber === kid.accountNumber &&
-        old.title === kid.title &&
-        old.iban === kid.iban)
-    {
-        return callback("MergeAccounts shouldn't have been called in the first place!");
-    }
-
-    log.info(`Merging (${old.accountNumber}, ${old.title}) with (${kid.accountNumber}, ${kid.title})`);
-
-    function replaceBankAccount(obj, next) {
-        if (obj.bankAccount !== kid.accountNumber)
-            obj.updateAttributes({bankAccount: kid.accountNumber}, next);
-        else
-            next();
-    }
-
-    // 1. Update operations
-    BankOperation.allFromBankAccount(old, (err, ops) => {
-        if (err) {
-            log.error(`when merging accounts (reading operations): ${err}`);
-            return callback(err);
+async function MergeAccounts(old, kid) {
+    try {
+        if (old.accountNumber === kid.accountNumber &&
+            old.title === kid.title &&
+            old.iban === kid.iban)
+        {
+            throw "MergeAccounts shouldn't have been called in the first place!";
         }
 
-        async.eachSeries(ops, replaceBankAccount, (err) => {
-            if (err) {
-                log.error(`when updating operations, on a merge: ${err}`);
-                return callback(err);
-            }
+        log.info(`Merging (${old.accountNumber}, ${old.title}) with (${kid.accountNumber}, ${kid.title})`);
 
-            // 2. Update alerts
-            BankAlert.allFromBankAccount(old, (err, als) => {
-                if (err) {
-                    log.error("when merging accounts (reading alerts): ${err}");
-                    return callback(err);
-                }
+        let ops = await BankOperation.allFromBankAccount(old);
+        for (let op of ops) {
+            if (op.bankAccount !== kid.accountNumber)
+                await op.updateAttributes({bankAccount: kid.accountNumber});
+        }
 
-                async.eachSeries(als, replaceBankAccount, err => {
-                    if (err) {
-                        log.error("when updating alerts, on a merge: ${err}");
-                        return callback(err);
-                    }
+        let alerts = BankAlert.allFromBankAccount(old);
+        for (let alert of alerts) {
+            if (alert.bankAccount !== kid.accountNumber)
+                await alert.updateAttributes({bankAccount: kid.accountNumber});
+        }
 
-                    // 3. Update account
-                    let newAccount = {
-                        accountNumber: kid.accountNumber,
-                        title: kid.title,
-                        iban: kid.iban
-                    };
+        let newAccount = {
+            accountNumber: kid.accountNumber,
+            title: kid.title,
+            iban: kid.iban
+        };
+        await old.updateAttributes(newAccount, callback);
 
-                    old.updateAttributes(newAccount, callback);
-                });
-            });
-        });
-    });
+    } catch (err) {
+        log.error(`when merging accounts: ${err}`);
+        // Pass error to the caller
+        throw err;
+    }
 }
 
 export default class AccountManager {
@@ -145,14 +124,10 @@ export default class AccountManager {
         this.notificator = new NotificationsHelper(appData.name);
     }
 
-    retrieveAccountsByBankAccess(access, callback) {
-        BANK_HANDLERS[access.bank].FetchAccounts(access.bank, access.login, access.password, access.website, (err, body) => {
+    async retrieveAccountsByBankAccess(access, callback) {
+        try {
 
-            if (err) {
-                log.error(`When fetching accounts: ${JSON.stringify(err)}`);
-                return callback(err);
-            }
-
+            let body = await BANK_HANDLERS[access.bank].FetchAccounts(access.bank, access.login, access.password, access.website);
             let accountsWeboob = body[`${access.bank}`];
             let accounts = [];
 
@@ -170,67 +145,42 @@ export default class AccountManager {
             }
 
             log.info(`-> ${accounts.length} bank account(s) found`);
+            let oldAccounts = await BankAccount.allFromBankAccess(access);
+            for (let account of accounts) {
 
-            this.processRetrievedAccounts(access, accounts, callback);
-        });
-    }
+                let matches = TryMatchAccount(account, oldAccounts);
+                if (matches.found) {
+                    log.info('Account was already present.');
+                    continue;
+                }
 
-    processRetrievedAccounts(access, newAccounts, callback) {
+                if (matches.mergeCandidates) {
+                    let m = matches.mergeCandidates;
+                    log.info('Found candidates for merging!');
+                    await MergeAccounts(m.old, m.new);
+                    continue;
+                }
 
-        BankAccount.allFromBankAccess(access, (err, oldAccounts) => {
-
-            if (err) {
-                log.error('when trying to find identical accounts:', err);
-                return callback(err);
+                log.info('New account found.');
+                let newAccount = await BankAccount.create(account);
+                this.newAccounts.push(newAccount);
             }
 
-            let processAccount = (account, callback) => {
-
-                    let matches = TryMatchAccount(account, oldAccounts);
-                    if (matches.found) {
-                        log.info('Account was already present.');
-                        callback(null);
-                        return;
-                    }
-
-                    if (matches.mergeCandidates) {
-                        let m = matches.mergeCandidates;
-                        log.info('Found candidates for merging!');
-                        MergeAccounts(m.old, m.new, callback);
-                        return;
-                    }
-
-                    log.info('New account found.');
-                    BankAccount.create(account, (err, account) => {
-                        if (err)
-                            return callback(err);
-                        this.newAccounts.push(account);
-                        callback();
-                    });
-
-            };
-
-            async.each(newAccounts, processAccount, err => {
-                if (err)
-                    log.info(err);
-                callback(err);
-            });
-        });
+        } catch(err) {
+            log.error(`Error when fetching accounts: ${err}`);
+            throw err;
+        }
     }
 
-    retrieveOperationsByBankAccess(access, callback) {
-
-        BANK_HANDLERS[access.bank].FetchOperations(access.bank, access.login, access.password, access.website, (err, body) => {
-
-            if (err) {
-                log.error(`When fetching operations: ${JSON.stringify(err)}`);
-                callback(err);
-                return
-            }
-
+    async retrieveOperationsByBankAccess(access, callback) {
+        try {
+            let body = await BANK_HANDLERS[access.bank].FetchOperations(access.bank, access.login, access.password, access.website);
             let operationsWeboob = body[`${access.bank}`];
             let operations = [];
             let now = moment();
+
+            // Normalize weboob information
+            // TODO could be done in the weboob source directly
             for (let operationWeboob of operationsWeboob) {
                 let relatedAccount = operationWeboob.account;
                 let operation = {
@@ -241,129 +191,80 @@ export default class AccountManager {
                     raw: operationWeboob.raw,
                     bankAccount: relatedAccount
                 };
+
                 let operationType = OperationType.getOperationTypeID(operationWeboob.type);
                 if (typeof operationType !== 'undefined')
                     operation.operationTypeID = operationType;
                 operations.push(operation);
             }
 
-            this.processRetrievedOperations(operations, callback);
-        });
+            // Create real new operations
+            for (let operation of operations) {
+                let operations = await BankOperation.allLike(operation);
+                if (operations && operations.length)
+                    continue;
 
-    }
-
-    processRetrievedOperations(operations, callback) {
-        async.each(operations, this.processRetrievedOperation.bind(this), (err) => {
-            if (err)
-                log.info(err);
-            this.afterOperationsRetrieved(callback);
-        });
-    }
-
-    processRetrievedOperation(operation, callback) {
-        BankOperation.allLike(operation, (err, operations) => {
-            if (err) {
-                log.error(`When comparing operations with an existing one: ${err}`);
-                callback(err);
-                return;
+                log.info("New operation found!");
+                let newOperation = await BankOperation.create(operation);
+                this.newOperations.push(newOperation);
             }
 
-            if (operations && operations.length)
-                return callback();
-
-            log.info("New operation found!");
-            BankOperation.create(operation, (err, operation) => {
-                if (err)
-                    return callback(err);
-                this.newOperations.push(operation);
-                callback();
-            });
-        });
+            await this.afterOperationsRetrieved();
+        } catch (err) {
+            log.error(`when fetching operations: ${err}`);
+            throw err;
+        }
     }
 
-    afterOperationsRetrieved(callback) {
-        let processes = [
-            this._updateInitialAmountFirstImport.bind(this),
-            this._updateLastCheckedBankAccount.bind(this),
-            this._notifyNewOperations.bind(this),
-            this._checkAccountsAlerts.bind(this),
-            this._checkOperationsAlerts.bind(this)
-        ];
+    async afterOperationsRetrieved(callback) {
+        try {
+            log.info("Updating initial amount in the case of newly imported accounts...");
+            for (let account of this.newAccounts) {
+                let relatedOperations = this.newOperations.slice().filter(op => op.bankAccount == account.accountNumber);
+                if (!relatedOperations.length)
+                    continue;
 
-        async.series(processes, (err) => {
-            if (err)
-                log.error("Post process error: ", err);
-            else
-                log.info("Post process: done.");
+                let offset = relatedOperations.reduce((acc, op) => acc + op.amount, 0);
+                account.initialAmount -= offset;
+                await account.save();
+            }
+
+            log.info("Updating 'last checked' date for all accounts...");
+            // TODO this is incorrect if you have several banks
+            let allAccounts = await BankAccount.all();
+            for (let account of allAccounts) {
+                await account.updateAttributes({lastChecked: new Date()});
+            }
+
+            log.info("Informing user new operations have been imported...");
+            let operationsCount = this.newOperations.length;
+            // Don't show the notification after importing a new account.
+            if (operationsCount > 0 && this.newAccounts.length === 0) {
+                let params = {
+                    text: `Kresus: ${operationsCount} new transaction(s) imported.`,
+                    resource: {
+                        app: 'kresus',
+                        url: '/'
+                    }
+                };
+                this.notificator.createTemporary(params);
+            }
+
+            log.info("Checking alerts for accounts balance...");
+            if (this.newOperations.length)
+                await alertManager.checkAlertsForAccounts();
+
+            log.info("Checking alerts for operations amount...");
+            await alertManager.checkAlertsForOperations(this.newOperations);
+
+            log.info("Post process: done.");
+
             // reset object
             this.newAccounts = [];
             this.newOperations = [];
-            callback(err);
-        });
-    }
-
-    _updateInitialAmountFirstImport(callback) {
-        if (!this.newAccounts.length)
-            return callback();
-
-        let process = (account, cb) => {
-            let relatedOperations = this.newOperations.slice().filter(op => op.bankAccount == account.accountNumber);
-            if (!relatedOperations.length)
-                return cb();
-            let offset = relatedOperations.reduce((acc, op) => acc + op.amount, 0);
-            account.initialAmount -= offset;
-            account.save(cb);
-            return
+        } catch(err) {
+            log.error(`Error when doing the post-processing: ${err}`);
+            throw err;
         }
-
-        async.each(this.newAccounts, process, callback);
-    }
-
-    _notifyNewOperations(callback) {
-        log.info("Informing user new operations have been imported...");
-        let operationsCount = this.newOperations.length;
-
-        // we don't show the notification on account import
-        if (operationsCount > 0 && this.newAccounts.length === 0) {
-            let params = {
-                text: `Kresus: ${operationsCount} new transaction(s) imported.`,
-                resource: {
-                    app: 'kresus',
-                    url: '/'
-                }
-            };
-            this.notificator.createTemporary(params);
-        }
-
-        callback();
-    }
-
-    _updateLastCheckedBankAccount(callback) {
-        log.info("Updating 'last checked' date for all accounts...");
-
-        // TODO this is incorrect if you have several banks
-        BankAccount.all((err, accounts) => {
-            if (err)
-                callback(err);
-            function process(account, callback) {
-                account.updateAttributes({lastChecked: new Date()}, callback);
-            }
-            async.each(accounts, process, callback);
-        });
-    }
-
-    _checkAccountsAlerts(callback) {
-        log.info("Checking alerts for accounts balance...");
-
-        // If no new operations, it is useless to notify the user again
-        if (this.newOperations.length > 0)
-            alertManager.checkAlertsForAccounts(callback);
-        else
-            callback();
-    }
-
-    _checkOperationsAlerts(callback) {
-        log.info("Checking alerts for operations amount");
-        alertManager.checkAlertsForOperations(this.newOperations, callback);
     }
 }

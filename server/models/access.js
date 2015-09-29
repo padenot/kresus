@@ -1,29 +1,48 @@
-import {module as americano} from '../db';
+let log = require('printit')({
+    prefix: 'models/access',
+    date: true
+});
 
-let BankAccess = americano.getModel('bankaccess', {
+import {module as americano} from '../db';
+import {promisify, promisifyModel} from '../helpers';
+
+let Access = americano.getModel('bankaccess', {
     bank: String,
     login: String,
     password: String,
     website: String
 });
 
-BankAccess.all = function(callback) {
-    BankAccess.request("all", callback);
-}
+Access = promisifyModel(Access);
 
-BankAccess.allFromBank = function(bank, callback) {
+function allFromBank(bank, callback) {
+    if (typeof bank !== 'object' || typeof bank.uuid !== 'string')
+        log.warn("Access.allFromBank API misuse: bank is probably not an Bank object");
+
     let params = {
         key: bank.uuid
     };
-    BankAccess.request("allByBank", params, callback);
-}
 
-BankAccess.allLike = function(access, callback) {
+    Access.request("allByBank", params, callback);
+};
+Access.allFromBank = promisify(Access::allFromBank);
+
+function allLike(access, callback) {
+    if (typeof access !== 'object' ||
+        typeof access.bank !== 'string' ||
+        typeof access.login !== 'string' ||
+        typeof access.password !== 'string')
+    {
+        log.warn("Access.allLike API misuse: access is probably not an Access object");
+    }
+
     let params = {
         key: [access.bank, access.login, access.password]
     };
-    BankAccess.request("allLike", params, callback);
-}
 
-export default BankAccess;
+    Access.request("allLike", params, callback);
+}
+Access.allLike = promisify(Access::allLike);
+
+export default Access;
 

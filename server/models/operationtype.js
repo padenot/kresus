@@ -1,17 +1,21 @@
-import {module as americano} from '../db';
-
 let log = require('printit')({
     prefix: 'models/operationtype',
     date: true
 });
+
+import {module as americano} from '../db';
+import {promisify, promisifyModel} from '../helpers';
 
 let OperationType = americano.getModel('operationtype', {
     name: String,
     weboobvalue: Number
 });
 
+OperationType = promisifyModel(OperationType);
+
 let MapOperationType = {};
 
+// Sync function
 function RecordOperationType(name, weboobId, id) {
     MapOperationType[`${weboobId}`] = {
         name,
@@ -19,12 +23,7 @@ function RecordOperationType(name, weboobId, id) {
     };
 }
 
-OperationType.all = function(callback) {
-    OperationType.request("all", callback);
-}
-
-
-OperationType.createOrUpdate = function(operationtype, callback) {
+function createOrUpdate(operationtype, callback) {
 
     let params = {
         key: operationtype.weboobvalue
@@ -39,7 +38,7 @@ OperationType.createOrUpdate = function(operationtype, callback) {
             RecordOperationType(operationtype.name, found[0].weboobvalue, found[0].id);
 
             if (found[0].name !== operationtype.name) {
-                found[0].updateAttributes({name: operationtype.name}, (err) => {
+                found[0].nopromises.updateAttributes({name: operationtype.name}, (err) => {
                     if (err)
                         return callback(err);
                     log.info(`Updated label of Operationtype with weboobvalue ${operationtype.weboobvalue}`);
@@ -54,7 +53,7 @@ OperationType.createOrUpdate = function(operationtype, callback) {
         }
 
         log.info(`Creating operationtype with weboobvalue ${operationtype.weboobvalue}...`);
-        OperationType.create(operationtype, (err,created) => {
+        OperationType.nopromises.create(operationtype, (err,created) => {
             if (err || !created)
                 return callback(err);
 
@@ -64,8 +63,10 @@ OperationType.createOrUpdate = function(operationtype, callback) {
         });
     });
 }
+OperationType.createOrUpdate = promisify(OperationType::createOrUpdate);
 
 
+// Sync function
 OperationType.getOperationTypeID = function(weboobvalue) {
     if (!weboobvalue)
         return undefined;
@@ -80,7 +81,7 @@ OperationType.getOperationTypeID = function(weboobvalue) {
     return MapOperationType[weboobvalue].id;
 }
 
-
+// Sync function
 OperationType.getAllOperationType = function() {
     return MapOperationType;
 }

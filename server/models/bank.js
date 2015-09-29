@@ -4,22 +4,23 @@ let log = require('printit')({
 });
 
 import {module as americano} from '../db';
+import {promisify, promisifyModel} from '../helpers';
 
-import BankAccount from './account';
+import Account from './account';
 
 let Bank = americano.getModel('bank', {
     name: String,
     uuid: String,
+    // TODO websites shouldn't be saved in memory
     websites: function(x) { return x }
 });
 
+Bank = promisifyModel(Bank);
 
-Bank.all = function(callback) {
-    Bank.request("allByName", callback);
-}
+function createOrUpdate(bank, callback) {
 
-
-Bank.createOrUpdate = function(bank, callback) {
+    if (typeof bank !== 'object' || typeof bank.uuid !== 'string')
+        log.warn("Bank.createOrUpdate API misuse: bank is probably not an instance of Bank");
 
     let params = {
         key: bank.uuid
@@ -51,18 +52,17 @@ Bank.createOrUpdate = function(bank, callback) {
         }
 
         log.info(`Creating bank with uuid ${bank.uuid}...`);
-        Bank.create(bank, callback);
+        Bank.nopromises.create.call(Bank, bank, callback);
     });
 }
+Bank.createOrUpdate = promisify(Bank::createOrUpdate);
 
-
-Bank.getBanksWithAccounts = function(callback) {
+function getBanksWithAccounts(callback) {
     let params = {
         group: true
     };
 
-    BankAccount.rawRequest('bankWithAccounts', params, (err, banks) => {
-
+    Account.rawRequest('bankWithAccounts', params, (err, banks) => {
         if (err)
             return callback(err, null);
 
@@ -70,20 +70,12 @@ Bank.getBanksWithAccounts = function(callback) {
             return callback(null, []);
 
         let uuids = banks.map(bank => bank.key);
-        Bank.getManyByUuid(uuids, (err, banks) => {
-            callback(err, banks);
-        });
+        let params = {
+            keys: uuids
+        };
+        Bank.request("byUuid", params, callback);
     });
 }
-
-
-Bank.getManyByUuid = function(uuids, callback) {
-    if (!(uuids instanceof Array))
-        uuids = [uuids]
-    let params = {
-        keys: uuids
-    };
-    Bank.request("byUuid", params, callback);
-}
+Bank.getBanksWithAccounts = promisify(Bank::getBanksWithAccounts);
 
 export default Bank;
